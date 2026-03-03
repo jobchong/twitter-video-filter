@@ -45,9 +45,22 @@
   }
 
   /**
+   * Check if we're on a tweet detail page (not timeline)
+   */
+  function isOnTweetPage() {
+    // URL pattern: twitter.com/username/status/1234567890 or x.com/username/status/1234567890
+    return /\/status\/\d+/.test(window.location.pathname);
+  }
+
+  /**
    * Process all tweets on the page
    */
   function filterVideoPosts() {
+    // Don't filter on tweet detail pages - user intentionally navigated there
+    if (isOnTweetPage()) {
+      return;
+    }
+
     const tweets = document.querySelectorAll(TWEET_SELECTOR);
     tweets.forEach(tweet => {
       if (containsVideo(tweet)) {
