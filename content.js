@@ -1,4 +1,4 @@
-// Twitter Video Filter - Hides posts containing video content
+// Twitter Video Filter - Hides video posts on the home timeline
 
 (function() {
   'use strict';
@@ -16,6 +16,73 @@
 
   // Selector for tweet articles
   const TWEET_SELECTOR = 'article[data-testid="tweet"]';
+  const CELL_SELECTOR = '[data-testid="cellInnerDiv"]';
+  const FILTERED_CLASS = 'twitter-video-filter-hidden';
+  const ROUTE_ATTR = 'data-twitter-video-filter-route';
+  const HOME_ROUTE = 'home';
+  const DISABLED_ROUTE = 'off';
+  const STYLE_ID = 'twitter-video-filter-styles';
+
+  let lastPath = window.location.pathname;
+  let filterScheduled = false;
+  let scrollTimeout;
+  let observer;
+
+  /**
+   * Install route-scoped CSS before tweets render to reduce visible reflow.
+   */
+  function installFilterStyles() {
+    if (document.getElementById(STYLE_ID)) return;
+
+    const style = document.createElement('style');
+    style.id = STYLE_ID;
+
+    const cssHasSelectors = VIDEO_SELECTORS
+      .map(selector =>
+        `html[${ROUTE_ATTR}="${HOME_ROUTE}"] ${CELL_SELECTOR}:has(${TWEET_SELECTOR} ${selector})`
+      )
+      .join(',\n');
+
+    style.textContent = `
+html[${ROUTE_ATTR}="${HOME_ROUTE}"] .${FILTERED_CLASS} {
+  display: none !important;
+}
+
+@supports selector(:has(*)) {
+${cssHasSelectors} {
+  display: none !important;
+}
+}
+`;
+
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  /**
+   * Check if we're on the home timeline.
+   */
+  function isHomeTimeline() {
+    return /^\/home\/?$/.test(window.location.pathname);
+  }
+
+  /**
+   * Keep CSS and filtering scoped to the current route.
+   */
+  function syncRouteState() {
+    lastPath = window.location.pathname;
+
+    const routeState = isHomeTimeline() ? HOME_ROUTE : DISABLED_ROUTE;
+
+    if (document.documentElement.getAttribute(ROUTE_ATTR) !== routeState) {
+      document.documentElement.setAttribute(ROUTE_ATTR, routeState);
+    }
+
+    if (routeState === HOME_ROUTE) {
+      scheduleFilterVideoPosts();
+    } else {
+      clearFilteredTweets();
+    }
+  }
 
   /**
    * Check if an element contains video content
@@ -30,50 +97,95 @@
   }
 
   /**
-   * Hide a tweet element and its parent container (which has the border)
+   * Find the timeline cell that owns a tweet.
+   */
+  function getTweetContainer(tweet) {
+    return tweet.closest(CELL_SELECTOR) || tweet;
+  }
+
+  /**
+   * Mark a tweet as filtered. CSS only hides it on the home timeline.
    */
   function hideTweet(tweet) {
-    if (tweet.dataset.videoFiltered) return;
+    const elementToHide = getTweetContainer(tweet);
+    if (elementToHide.classList.contains(FILTERED_CLASS)) return;
 
-    // Find the parent cellInnerDiv which contains the border
-    const cellWrapper = tweet.closest('[data-testid="cellInnerDiv"]');
-    const elementToHide = cellWrapper || tweet;
-
-    elementToHide.style.display = 'none';
+    elementToHide.classList.add(FILTERED_CLASS);
     tweet.dataset.videoFiltered = 'true';
     console.log('[Twitter Video Filter] Blocked a video post');
   }
 
   /**
-   * Check if we're on a tweet detail page (not timeline)
+   * Remove a stale filtered mark from a tweet/container.
    */
-  function isOnTweetPage() {
-    // URL pattern: twitter.com/username/status/1234567890 or x.com/username/status/1234567890
-    return /\/status\/\d+/.test(window.location.pathname);
+  function showTweet(tweet) {
+    getTweetContainer(tweet).classList.remove(FILTERED_CLASS);
+    delete tweet.dataset.videoFiltered;
   }
 
   /**
-   * Process all tweets on the page
+   * Clear route-scoped filtering marks when leaving the home timeline.
+   */
+  function clearFilteredTweets() {
+    document.querySelectorAll(`.${FILTERED_CLASS}`).forEach(element => {
+      element.classList.remove(FILTERED_CLASS);
+    });
+
+    document.querySelectorAll(`${TWEET_SELECTOR}[data-video-filtered]`).forEach(tweet => {
+      delete tweet.dataset.videoFiltered;
+    });
+  }
+
+  /**
+   * Process all tweets on the page.
    */
   function filterVideoPosts() {
-    // Don't filter on tweet detail pages - user intentionally navigated there
-    if (isOnTweetPage()) {
-      return;
-    }
+    if (!isHomeTimeline()) return;
 
     const tweets = document.querySelectorAll(TWEET_SELECTOR);
     tweets.forEach(tweet => {
       if (containsVideo(tweet)) {
         hideTweet(tweet);
+      } else {
+        showTweet(tweet);
       }
     });
+  }
+
+  /**
+   * Batch filtering work so one render burst causes one scan.
+   */
+  function scheduleFilterVideoPosts() {
+    if (filterScheduled) return;
+
+    filterScheduled = true;
+    requestAnimationFrame(() => {
+      filterScheduled = false;
+      filterVideoPosts();
+    });
+  }
+
+  /**
+   * Detect SPA route changes, including browser/site back navigation.
+   */
+  function checkRouteChange() {
+    if (window.location.pathname === lastPath) return;
+
+    lastPath = window.location.pathname;
+    syncRouteState();
   }
 
   /**
    * Set up MutationObserver to handle dynamically loaded content
    */
   function setupObserver() {
-    const observer = new MutationObserver((mutations) => {
+    if (observer) return observer;
+
+    observer = new MutationObserver((mutations) => {
+      checkRouteChange();
+
+      if (!isHomeTimeline()) return;
+
       let shouldFilter = false;
 
       for (const mutation of mutations) {
@@ -84,7 +196,7 @@
       }
 
       if (shouldFilter) {
-        filterVideoPosts();
+        scheduleFilterVideoPosts();
       }
     });
 
@@ -96,18 +208,31 @@
     return observer;
   }
 
-  // Initial filter pass
-  filterVideoPosts();
+  function setupScrollListener() {
+    window.addEventListener('scroll', () => {
+      if (!isHomeTimeline()) return;
 
-  // Set up observer for dynamically loaded tweets
-  setupObserver();
+      clearTimeout(scrollTimeout);
+      scrollTimeout = setTimeout(scheduleFilterVideoPosts, 100);
+    }, { passive: true });
+  }
 
-  // Also filter on scroll (backup for any missed tweets)
-  let scrollTimeout;
-  window.addEventListener('scroll', () => {
-    clearTimeout(scrollTimeout);
-    scrollTimeout = setTimeout(filterVideoPosts, 100);
-  }, { passive: true });
+  function startWhenBodyExists() {
+    if (!document.body) {
+      requestAnimationFrame(startWhenBodyExists);
+      return;
+    }
+
+    syncRouteState();
+    setupObserver();
+    setupScrollListener();
+  }
+
+  installFilterStyles();
+  syncRouteState();
+  startWhenBodyExists();
+  window.addEventListener('popstate', syncRouteState);
+  setInterval(checkRouteChange, 250);
 
   console.log('[Twitter Video Filter] Extension loaded');
 })();
