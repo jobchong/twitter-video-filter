@@ -22,11 +22,15 @@
   const HOME_ROUTE = 'home';
   const DISABLED_ROUTE = 'off';
   const STYLE_ID = 'twitter-video-filter-styles';
+  const STATUS_CLICK_UNBLOCK_MS = 1500;
+
+  const VIDEO_SELECTOR_LIST = VIDEO_SELECTORS.join(',');
 
   let lastPath = window.location.pathname;
-  let filterScheduled = false;
   let scrollTimeout;
   let observer;
+  let routeSyncTimeout;
+  let statusClickUnblockUntil = 0;
 
   /**
    * Install route-scoped CSS before tweets render to reduce visible reflow.
@@ -66,19 +70,26 @@ ${cssHasSelectors} {
   }
 
   /**
+   * Keep filtering off briefly during an intentional click-through transition.
+   */
+  function shouldFilterHomeTimeline() {
+    return isHomeTimeline() && Date.now() >= statusClickUnblockUntil;
+  }
+
+  /**
    * Keep CSS and filtering scoped to the current route.
    */
   function syncRouteState() {
     lastPath = window.location.pathname;
 
-    const routeState = isHomeTimeline() ? HOME_ROUTE : DISABLED_ROUTE;
+    const routeState = shouldFilterHomeTimeline() ? HOME_ROUTE : DISABLED_ROUTE;
 
     if (document.documentElement.getAttribute(ROUTE_ATTR) !== routeState) {
       document.documentElement.setAttribute(ROUTE_ATTR, routeState);
     }
 
     if (routeState === HOME_ROUTE) {
-      scheduleFilterVideoPosts();
+      filterVideoPosts();
     } else {
       clearFilteredTweets();
     }
@@ -88,12 +99,7 @@ ${cssHasSelectors} {
    * Check if an element contains video content
    */
   function containsVideo(element) {
-    for (const selector of VIDEO_SELECTORS) {
-      if (element.querySelector(selector)) {
-        return true;
-      }
-    }
-    return false;
+    return !!element.querySelector(VIDEO_SELECTOR_LIST);
   }
 
   /**
@@ -101,6 +107,22 @@ ${cssHasSelectors} {
    */
   function getTweetContainer(tweet) {
     return tweet.closest(CELL_SELECTOR) || tweet;
+  }
+
+  /**
+   * Undo hidden state from this version and stale inline styles from older versions.
+   */
+  function clearTweetHiddenState(tweet) {
+    const elementToShow = getTweetContainer(tweet);
+
+    elementToShow.classList.remove(FILTERED_CLASS);
+
+    if (tweet.dataset.videoFiltered === 'true') {
+      elementToShow.style.removeProperty('display');
+      tweet.style.removeProperty('display');
+    }
+
+    delete tweet.dataset.videoFiltered;
   }
 
   /**
@@ -119,8 +141,7 @@ ${cssHasSelectors} {
    * Remove a stale filtered mark from a tweet/container.
    */
   function showTweet(tweet) {
-    getTweetContainer(tweet).classList.remove(FILTERED_CLASS);
-    delete tweet.dataset.videoFiltered;
+    clearTweetHiddenState(tweet);
   }
 
   /**
@@ -132,37 +153,27 @@ ${cssHasSelectors} {
     });
 
     document.querySelectorAll(`${TWEET_SELECTOR}[data-video-filtered]`).forEach(tweet => {
-      delete tweet.dataset.videoFiltered;
+      clearTweetHiddenState(tweet);
     });
+  }
+
+  /**
+   * Classify and hide/show one tweet.
+   */
+  function processTweet(tweet) {
+    if (containsVideo(tweet)) {
+      hideTweet(tweet);
+    } else {
+      showTweet(tweet);
+    }
   }
 
   /**
    * Process all tweets on the page.
    */
   function filterVideoPosts() {
-    if (!isHomeTimeline()) return;
-
-    const tweets = document.querySelectorAll(TWEET_SELECTOR);
-    tweets.forEach(tweet => {
-      if (containsVideo(tweet)) {
-        hideTweet(tweet);
-      } else {
-        showTweet(tweet);
-      }
-    });
-  }
-
-  /**
-   * Batch filtering work so one render burst causes one scan.
-   */
-  function scheduleFilterVideoPosts() {
-    if (filterScheduled) return;
-
-    filterScheduled = true;
-    requestAnimationFrame(() => {
-      filterScheduled = false;
-      filterVideoPosts();
-    });
+    if (!shouldFilterHomeTimeline()) return;
+    document.querySelectorAll(TWEET_SELECTOR).forEach(processTweet);
   }
 
   /**
@@ -176,6 +187,36 @@ ${cssHasSelectors} {
   }
 
   /**
+   * Re-check route state after X updates its SPA location.
+   */
+  function scheduleRouteSync() {
+    clearTimeout(routeSyncTimeout);
+    routeSyncTimeout = setTimeout(syncRouteState, 0);
+  }
+
+  /**
+   * A status click is an intentional click-through, so unblock before X swaps DOM.
+   */
+  function handleDocumentClick(event) {
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+      return;
+    }
+
+    const eventTarget = event.target;
+    const target = eventTarget instanceof Element ? eventTarget : eventTarget && eventTarget.parentElement;
+    if (!target) return;
+
+    const statusLink = target.closest('a[href*="/status/"]');
+    if (!statusLink) return;
+
+    statusClickUnblockUntil = Date.now() + STATUS_CLICK_UNBLOCK_MS;
+    document.documentElement.setAttribute(ROUTE_ATTR, DISABLED_ROUTE);
+    clearFilteredTweets();
+    scheduleRouteSync();
+    setTimeout(syncRouteState, STATUS_CLICK_UNBLOCK_MS);
+  }
+
+  /**
    * Set up MutationObserver to handle dynamically loaded content
    */
   function setupObserver() {
@@ -184,20 +225,21 @@ ${cssHasSelectors} {
     observer = new MutationObserver((mutations) => {
       checkRouteChange();
 
-      if (!isHomeTimeline()) return;
+      if (!shouldFilterHomeTimeline()) return;
 
-      let shouldFilter = false;
+      const tweetsToCheck = new Set();
 
       for (const mutation of mutations) {
-        if (mutation.addedNodes.length > 0) {
-          shouldFilter = true;
-          break;
+        for (const node of mutation.addedNodes) {
+          if (node.nodeType !== Node.ELEMENT_NODE) continue;
+
+          const tweetAncestor = node.closest(TWEET_SELECTOR);
+          if (tweetAncestor) tweetsToCheck.add(tweetAncestor);
+          node.querySelectorAll(TWEET_SELECTOR).forEach(t => tweetsToCheck.add(t));
         }
       }
 
-      if (shouldFilter) {
-        scheduleFilterVideoPosts();
-      }
+      tweetsToCheck.forEach(processTweet);
     });
 
     observer.observe(document.body, {
@@ -210,11 +252,23 @@ ${cssHasSelectors} {
 
   function setupScrollListener() {
     window.addEventListener('scroll', () => {
-      if (!isHomeTimeline()) return;
+      if (!shouldFilterHomeTimeline()) return;
 
       clearTimeout(scrollTimeout);
-      scrollTimeout = setTimeout(scheduleFilterVideoPosts, 100);
+      scrollTimeout = setTimeout(filterVideoPosts, 100);
     }, { passive: true });
+  }
+
+  function setupNavigationListeners() {
+    document.addEventListener('click', handleDocumentClick, true);
+    window.addEventListener('popstate', syncRouteState);
+    window.addEventListener('hashchange', syncRouteState);
+
+    if ('navigation' in window) {
+      window.navigation.addEventListener('navigate', scheduleRouteSync);
+      window.navigation.addEventListener('currententrychange', syncRouteState);
+      window.navigation.addEventListener('navigatesuccess', syncRouteState);
+    }
   }
 
   function startWhenBodyExists() {
@@ -226,12 +280,12 @@ ${cssHasSelectors} {
     syncRouteState();
     setupObserver();
     setupScrollListener();
+    setupNavigationListeners();
   }
 
   installFilterStyles();
   syncRouteState();
   startWhenBodyExists();
-  window.addEventListener('popstate', syncRouteState);
   setInterval(checkRouteChange, 250);
 
   console.log('[Twitter Video Filter] Extension loaded');
