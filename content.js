@@ -22,15 +22,12 @@
   const HOME_ROUTE = 'home';
   const DISABLED_ROUTE = 'off';
   const STYLE_ID = 'twitter-video-filter-styles';
-  const STATUS_CLICK_UNBLOCK_MS = 1500;
 
   const VIDEO_SELECTOR_LIST = VIDEO_SELECTORS.join(',');
 
   let lastPath = window.location.pathname;
   let scrollTimeout;
   let observer;
-  let routeSyncTimeout;
-  let statusClickUnblockUntil = 0;
 
   /**
    * Install route-scoped CSS before tweets render to reduce visible reflow.
@@ -70,19 +67,12 @@ ${cssHasSelectors} {
   }
 
   /**
-   * Keep filtering off briefly during an intentional click-through transition.
-   */
-  function shouldFilterHomeTimeline() {
-    return isHomeTimeline() && Date.now() >= statusClickUnblockUntil;
-  }
-
-  /**
    * Keep CSS and filtering scoped to the current route.
    */
   function syncRouteState() {
     lastPath = window.location.pathname;
 
-    const routeState = shouldFilterHomeTimeline() ? HOME_ROUTE : DISABLED_ROUTE;
+    const routeState = isHomeTimeline() ? HOME_ROUTE : DISABLED_ROUTE;
 
     if (document.documentElement.getAttribute(ROUTE_ATTR) !== routeState) {
       document.documentElement.setAttribute(ROUTE_ATTR, routeState);
@@ -90,9 +80,11 @@ ${cssHasSelectors} {
 
     if (routeState === HOME_ROUTE) {
       filterVideoPosts();
-    } else {
-      clearFilteredTweets();
     }
+
+    // Keep classifications on X's cached timeline while another route is open.
+    // The route-scoped CSS makes them inert off /home and reapplies them before
+    // the cached timeline paints when the user navigates back.
   }
 
   /**
@@ -145,19 +137,6 @@ ${cssHasSelectors} {
   }
 
   /**
-   * Clear route-scoped filtering marks when leaving the home timeline.
-   */
-  function clearFilteredTweets() {
-    document.querySelectorAll(`.${FILTERED_CLASS}`).forEach(element => {
-      element.classList.remove(FILTERED_CLASS);
-    });
-
-    document.querySelectorAll(`${TWEET_SELECTOR}[data-video-filtered]`).forEach(tweet => {
-      clearTweetHiddenState(tweet);
-    });
-  }
-
-  /**
    * Classify and hide/show one tweet.
    */
   function processTweet(tweet) {
@@ -172,7 +151,7 @@ ${cssHasSelectors} {
    * Process all tweets on the page.
    */
   function filterVideoPosts() {
-    if (!shouldFilterHomeTimeline()) return;
+    if (!isHomeTimeline()) return;
     document.querySelectorAll(TWEET_SELECTOR).forEach(processTweet);
   }
 
@@ -187,36 +166,6 @@ ${cssHasSelectors} {
   }
 
   /**
-   * Re-check route state after X updates its SPA location.
-   */
-  function scheduleRouteSync() {
-    clearTimeout(routeSyncTimeout);
-    routeSyncTimeout = setTimeout(syncRouteState, 0);
-  }
-
-  /**
-   * A status click is an intentional click-through, so unblock before X swaps DOM.
-   */
-  function handleDocumentClick(event) {
-    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
-      return;
-    }
-
-    const eventTarget = event.target;
-    const target = eventTarget instanceof Element ? eventTarget : eventTarget && eventTarget.parentElement;
-    if (!target) return;
-
-    const statusLink = target.closest('a[href*="/status/"]');
-    if (!statusLink) return;
-
-    statusClickUnblockUntil = Date.now() + STATUS_CLICK_UNBLOCK_MS;
-    document.documentElement.setAttribute(ROUTE_ATTR, DISABLED_ROUTE);
-    clearFilteredTweets();
-    scheduleRouteSync();
-    setTimeout(syncRouteState, STATUS_CLICK_UNBLOCK_MS);
-  }
-
-  /**
    * Set up MutationObserver to handle dynamically loaded content
    */
   function setupObserver() {
@@ -225,7 +174,7 @@ ${cssHasSelectors} {
     observer = new MutationObserver((mutations) => {
       checkRouteChange();
 
-      if (!shouldFilterHomeTimeline()) return;
+      if (!isHomeTimeline()) return;
 
       const tweetsToCheck = new Set();
 
@@ -252,7 +201,7 @@ ${cssHasSelectors} {
 
   function setupScrollListener() {
     window.addEventListener('scroll', () => {
-      if (!shouldFilterHomeTimeline()) return;
+      if (!isHomeTimeline()) return;
 
       clearTimeout(scrollTimeout);
       scrollTimeout = setTimeout(filterVideoPosts, 100);
@@ -260,12 +209,10 @@ ${cssHasSelectors} {
   }
 
   function setupNavigationListeners() {
-    document.addEventListener('click', handleDocumentClick, true);
     window.addEventListener('popstate', syncRouteState);
     window.addEventListener('hashchange', syncRouteState);
 
     if ('navigation' in window) {
-      window.navigation.addEventListener('navigate', scheduleRouteSync);
       window.navigation.addEventListener('currententrychange', syncRouteState);
       window.navigation.addEventListener('navigatesuccess', syncRouteState);
     }
